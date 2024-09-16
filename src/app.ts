@@ -1,8 +1,9 @@
 import { exit } from "process";
 import { PeerRecord } from "./protobuf/overlay_peer_table";
-import Docker, { NetworkInspectInfo } from "dockerode";
+import Docker, { ContainerInfo, ContainerInspectInfo, NetworkContainer, NetworkInspectInfo } from "dockerode";
 import { EndpointRecord } from "./protobuf/endpoint_table";
-import { exec, execSync } from "child_process";
+import { execSync } from "child_process";
+import express from 'express';
 
 const checkIntervalInSeconds = parseInt(
     process.env.CHECK_INTERVAL_IN_SECONDS || "60"
@@ -10,6 +11,8 @@ const checkIntervalInSeconds = parseInt(
 const networkDiagnosticServerPort = parseInt(
     process.env.NETWORK_DIAGNOSTIC_PORT || "2000"
 );
+
+const port = parseInt(process.env.PORT || '3175');
 
 const docker = new Docker();
 
@@ -31,6 +34,11 @@ interface GetTableResult {
         size: number;
         entries: { key: string; value: string; owner: string }[];
     };
+}
+
+function hasContainerWithIp(network: { Containers?: Record<string, NetworkContainer> }, ip: string) {
+    const containers = Object.entries(network.Containers || {}).map(([id, container]) => ({ ...container, id }));
+    return containers.some((x) => x.IPv4Address.split('/')[0] === ip)
 }
 
 async function checkTable(tableName: string, network: NetworkInspectInfo, ownPeerName: string) {
@@ -55,7 +63,7 @@ async function checkTable(tableName: string, network: NetworkInspectInfo, ownPee
         value: decoder(Buffer.from(x.value, "base64")),
     }));
 
-    //console.log(entries);
+    // console.log(entries);
 
     // We are using a Set here, because multiple entries with the same owner are considered the same for now
     // TODO: Add special handling for the case where multiple entries have the same owner but different values
@@ -71,7 +79,7 @@ async function checkTable(tableName: string, network: NetworkInspectInfo, ownPee
 
     const invalidEntries = Object.entries(grouped)
         .filter(([endpointIp, owners]) => owners.size > 1)
-        .map(([endpointIp, owners]) => ({ endpointIp, owners: [...owners] }));
+        .map(([endpointIp, owners]) => ({ endpointIp: endpointIp.split('/')[0], owners: [...owners] }));
 
     if (invalidEntries.length) {
         console.log(
@@ -79,26 +87,38 @@ async function checkTable(tableName: string, network: NetworkInspectInfo, ownPee
             invalidEntries
         );
 
-        // If an invalid entry contains our own peer name and if the container is not running on our server: leavenetwork / joinnetwork
-        // Assumption: The network DB is the same on each server
-        const containers = Object.entries(network.Containers || {}).map(([id, container]) => ({ ...container, id }));
-        if (containers.length) {
-            const invalidEntriesOwnedByUs = invalidEntries.filter((x) => x.owners.some((y) => y === ownPeerName));
-            for (const invalidEntry of invalidEntriesOwnedByUs) {
-                if (containers.every((x) => x.IPv4Address.split('/')[0] !== invalidEntry.endpointIp.split('/')[0])) {
-                    // We own an entry in the network table for a container that is not running here. That's invalid data
-                    console.log(
-                        `This node owns an entry in the '${tableName}' table for a container that it is not running. Fixing it by leaving and re-joining the network.`
-                    );
-                    return true;
-                }
+        let rejoinSelf = false;
+
+        const invalidEntriesOwnedByUs = invalidEntries.filter((x) => x.owners.some((y) => y === ownPeerName));
+        for (const invalidEntry of invalidEntriesOwnedByUs) {
+            if (!hasContainerWithIp(network, invalidEntry.endpointIp)) {
+                console.log(
+                    `This node owns an entry in the '${tableName}' table for a container that it is not running. Fixing it by leaving and re-joining the network.`
+                );
+                rejoinSelf = true;
+                break;
             }
         }
+
+        return {
+            nodesToPotentiallyRejoin: invalidEntries.reduce<Record<string, string[]>>((acc, curr) => {
+                for (const owner of curr.owners) {
+                    if (owner !== ownPeerName) {
+                        if (!acc[owner]?.length) {
+                            acc[owner] = [];
+                        }
+                        acc[owner].push(curr.endpointIp)
+                    }
+                }
+                return acc;
+            }, {}),
+            rejoinSelf
+        };
     } else {
         console.log(`Found no invalid entries in table '${tableName}'.`);
     }
 
-    return false;
+    return;
 }
 
 async function getOwnPeerName(networkId: string) {
@@ -106,10 +126,21 @@ async function getOwnPeerName(networkId: string) {
     const ownAddress = info.Swarm.NodeAddr;
     const networkDetails = await docker.getNetwork(networkId).inspect();
     if (!networkDetails.Peers?.length)
-        return null;
-    const ownPeerName = networkDetails.Peers.filter((x: { Name: string; IP: string }) => x.IP === ownAddress)[0].Name;
+        return { ownPeerName: null, peerIps: [] };
+    const peers: { Name: string; IP: string }[] = networkDetails.Peers;
+    const ownPeerName = peers.filter(x => x.IP === ownAddress)[0].Name;
+    const peerIps = peers.reduce<Record<string, string>>((acc, curr) => {
+        acc[curr.Name] = curr.IP;
+        return acc
+    }, {});
     console.log('Own peer name: ', ownPeerName);
-    return ownPeerName;
+    return { ownPeerName, peerIps };
+}
+
+async function rejoinNetwork(network: { Id: string, Name: string }) {
+    await fetch(getLeaveNetworkUrl(network.Id));
+    await fetch(getJoinNetworkUrl(network.Id));
+    console.log(`Rejoined network ${network.Name}`)
 }
 
 async function checkTables() {
@@ -119,7 +150,7 @@ async function checkTables() {
             continue;
 
         console.log(`...for network ${network.Name} (${network.Id})`);
-        const ownPeerName = await getOwnPeerName(network.Id);
+        const { ownPeerName, peerIps } = await getOwnPeerName(network.Id);
         if (!ownPeerName?.length) {
             console.warn(
                 `Couldn't determine own peer name for network ${network.Name}. Probably, because there are no containers participating in that network on this node. Skipping handling network.`
@@ -129,20 +160,45 @@ async function checkTables() {
         const invalidEntryInEndpointTable = await checkTable('endpoint_table', network, ownPeerName);
         const invalidEntryInOverlayPeerTable = await checkTable('overlay_peer_table', network, ownPeerName);
 
-        if (invalidEntryInEndpointTable || invalidEntryInOverlayPeerTable) {
-            await fetch(getLeaveNetworkUrl(network.Id));
-            await fetch(getJoinNetworkUrl(network.Id));
-            console.log(`Rejoined network ${network.Name}`)
+        if (invalidEntryInEndpointTable?.rejoinSelf || invalidEntryInOverlayPeerTable?.rejoinSelf) {
+            await rejoinNetwork(network);
+        }
+
+        const nodesToPotentiallyRejoin = [
+            ...Object.entries(invalidEntryInEndpointTable?.nodesToPotentiallyRejoin || {}),
+            ...Object.entries(invalidEntryInOverlayPeerTable?.nodesToPotentiallyRejoin || {})]
+            .reduce<Record<string, Set<string>>>((acc, [owner, endpointIps]) => {
+                if (!acc[owner]?.size) {
+                    acc[owner] = new Set<string>();
+                }
+                for (const endpointIp of endpointIps)
+                    acc[owner].add(endpointIp)
+                return acc;
+            }, {});
+
+        for (const [nodePeerName, endpointIps] of Object.entries(nodesToPotentiallyRejoin)) {
+            try {
+                console.log(`Asking peer ${nodePeerName} to rejoin network ${network.Name} if necessary`)
+                await fetch(`http://${peerIps[nodePeerName]}:${port}/rejoin-if-necessary/${network.Id}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        endpointIps: [...endpointIps]
+                    })
+                });
+            } catch (e) {
+                console.warn(`Error asking peer ${nodePeerName} to rejoin network ${network.Name} if necessary: `, e);
+            }
         }
     }
     console.log("Done");
+    setTimeout(checkTables, checkIntervalInSeconds * 1000);
 }
 
 async function main() {
     try {
-        execSync('docker run --rm --pid=host --net=host --privileged -v /etc/docker/daemon.json:/etc/docker/daemon.json -v /var/run/docker.sock:/var/run/docker.sock sovarto/enable-docker-network-diagnostic-server:0.0.4', { stdio: "inherit" })
+        execSync('docker run --rm --pid=host --net=host --privileged -v /etc/docker/daemon.json:/etc/docker/daemon.json -v /var/run/docker.sock:/var/run/docker.sock sovarto/enable-docker-network-diagnostic-server:1.0.0', { stdio: "inherit" })
         await checkTables();
-        setTimeout(checkTables, checkIntervalInSeconds * 1000);
     } catch (e) {
         console.error(e);
         exit(1);
@@ -150,3 +206,32 @@ async function main() {
 }
 
 main();
+
+const app = express();
+app.use(express.json());
+
+app.post('/rejoin-if-necessary/:networkId', async (req, res) => {
+    const networkId = req.params.networkId;        // Extract networkId from URL
+    const endpointIps = req.body.endpointIps;      // Extract endpoint IPs array from body
+
+    // Validate the received data
+    if (!Array.isArray(endpointIps)) {
+        return res.status(400).send('endpointIps must be an array.');
+    }
+
+    console.log(`Received request to rejoin network ${networkId}, if at least one of the following IPs has no corresponding container on this node:\n`, endpointIps);
+
+    const network = await docker.getNetwork(networkId).inspect();
+    if (endpointIps.some(x => !hasContainerWithIp(network, x))) {
+        console.log('At least for some of the specified IPs there is no container running on this node, so we rejoin')
+        await rejoinNetwork(network);
+    } else {
+        console.log('For all specified IPs, there is a corresponding container running on this node. Not rejoining.')
+    }
+});
+
+app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+});
+
+
