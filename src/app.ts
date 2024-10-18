@@ -12,7 +12,7 @@ const checkIntervalInSeconds = parseInt(
 const networkDiagnosticServerPort = parseInt(
     process.env.NETWORK_DIAGNOSTIC_PORT || '2000'
 );
-
+const onlyReportErrors = process.env.ONLY_REPORT_ERRORS === 'true';
 const port = parseInt(process.env.PORT || '3175');
 
 const docker = new Docker();
@@ -140,8 +140,12 @@ async function checkTables() {
                             try {
                                 if (!hasContainerWithIp(network, invalidEntry.endpointIp)) {
                                     for (const key of keys) {
-                                        console.log(`Deleting invalid entry for IP ${ invalidEntry.endpointIp } with key ${ key } owned by us...`);
-                                        await deleteEntry(table, network.Id, key);
+                                        if (onlyReportErrors) {
+                                            console.log(`Entry for IP ${invalidEntry.endpointIp} with key ${key} owned by us is invalid`);
+                                        } else {
+                                            console.log(`Deleting invalid entry for IP ${invalidEntry.endpointIp} with key ${key} owned by us...`);
+                                            await deleteEntry(table, network.Id, key);
+                                        }
                                     }
                                 }
                             } catch (e) {
@@ -154,8 +158,12 @@ async function checkTables() {
                                     network.Id,
                                     invalidEntry.endpointIp))) {
                                     for (const key of keys) {
-                                        console.log(`Deleting invalid entry for IP ${ invalidEntry.endpointIp } with key ${ key } owned by ${ owner } (IP: ${ peerIps[owner] })...`);
-                                        await deleteEntry(table, network.Id, key);
+                                        if (onlyReportErrors) {
+                                            console.log(`Entry for IP ${invalidEntry.endpointIp} with key ${key} owned by ${owner} (IP: ${peerIps[owner]}) is invalid`);
+                                        } else {
+                                            console.log(`Deleting invalid entry for IP ${invalidEntry.endpointIp} with key ${key} owned by ${owner} (IP: ${peerIps[owner]})...`);
+                                            await deleteEntry(table, network.Id, key);
+                                        }
                                     }
                                 }
                             } catch (e) {
