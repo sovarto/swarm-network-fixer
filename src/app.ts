@@ -40,7 +40,7 @@ function hasContainerWithIp(network: { Containers?: Record<string, NetworkContai
     return containers.some((x) => x.IPv4Address.split('/')[0] === ip);
 }
 
-async function checkTable(tableName: string, network: NetworkInspectInfo) {
+async function getTableEntries(tableName: string, network: NetworkInspectInfo) {
     let decoder: (input: Uint8Array) => { endpointIp: string };
     switch (tableName) {
         case 'endpoint_table':
@@ -59,12 +59,14 @@ async function checkTable(tableName: string, network: NetworkInspectInfo) {
         return [];
     }
 
-    const entries = json.details.entries.map((x) => ({
+    return json.details.entries.map((x) => ({
         ...x,
         value: decoder(Buffer.from(x.value, 'base64')),
     }));
+}
 
-    // console.log(entries);
+async function getInvalidEntriesByIp(tableName: string, network: NetworkInspectInfo) {
+    const entries = await getTableEntries(tableName, network);
 
     const grouped = entries.reduce<Record<string, Map<string, string[]>>>(
         (acc, curr) => {
@@ -134,7 +136,7 @@ async function checkTables() {
 
             const tablesToCheck = ['endpoint_table', 'overlay_peer_table'];
             for (const table of tablesToCheck) {
-                for (const invalidEntry of await checkTable(table, network)) {
+                for (const invalidEntry of await getInvalidEntriesByIp(table, network)) {
                     for (const { owner, keys } of invalidEntry.entries) {
                         if (owner === ownPeerName) {
                             try {
